@@ -17,8 +17,8 @@ const LLMS_TXT = "https://filamentphp.com/docs/llms.txt";
 
 // ─── LRU Cache ───────────────────────────────────────────────────────────────
 
-const CACHE_MAX = 20;
-const DOC_TTL = 60 * 60 * 1000; // 1 hour for doc pages
+const CACHE_MAX = 100;
+const DOC_TTL = 3 * 60 * 60 * 1000; // 3 hours for doc pages
 const INDEX_TTL = 3 * 60 * 60 * 1000; // 3 hours for llms.txt index
 const cache = new Map();
 
@@ -63,6 +63,12 @@ async function fetchText(url, ttl = DOC_TTL) {
 
 function cleanMarkdown(md) {
   let out = md;
+
+  // Remove HTML comments
+  out = out.replace(/<!--[\s\S]*?-->/g, "");
+
+  // Remove JSX imports
+  out = out.replace(/^import\s+[\s\S]*?from\s+['"][^'"]+['"];?\s*$/gm, "");
 
   // Remove JSX component definitions (export const AutoScreenshot = ...; etc.)
   // These are multi-line JSX blocks that end with `};`
