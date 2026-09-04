@@ -1,22 +1,60 @@
 {
   "name": "filament-mcp",
   "version": "2.0.0",
-  "description": "Token-optimized MCP server for Filament v5 documentation",
+  "description": "Model Context Protocol server that serves Filament v5 documentation to AI coding agents",
   "type": "module",
   "main": "index.js",
+  "bin": {
+    "filament-mcp": "index.js"
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/core.test.mjs test/env-example.test.mjs test/filament.test.mjs",
+    "test:integration": "node --test --test-timeout=90000 test/integration.test.mjs",
+    "test:all": "npm test && npm run test:integration"
   },
   "keywords": [
-    "filament",
     "mcp",
+    "mcp-server",
+    "modelcontextprotocol",
+    "model-context-protocol",
+    "filament",
+    "filamentphp",
     "laravel",
-    "documentation"
+    "php",
+    "documentation",
+    "ai",
+    "llm",
+    "claude",
+    "cursor"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "Ajay Mahato (https://github.com/ajaymahato431)",
+  "license": "MIT",
+  "homepage": "https://github.com/ajaymahato431/filament-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ajaymahato431/filament-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ajaymahato431/filament-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
   }
 }

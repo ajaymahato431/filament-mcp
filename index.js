@@ -1,516 +1,277 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+#!/usr/bin/env node
+/**
+ * filament-mcp — Model Context Protocol server for Filament documentation.
+ *
+ * Fetches, cleans and serves Filament docs to AI agents over stdio, with an
+ * emphasis on returning the smallest useful slice of a page.
+ */
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+import { bootstrap } from "./src/core/config.js";
+import { createHttpClient } from "./src/core/http.js";
+import { extractSection, renderOutline } from "./src/core/markdown.js";
+import { searchEntries } from "./src/core/search.js";
+import { runMain, serveStdio, textResult, errorResult, safeHandler } from "./src/core/runtime.js";
 import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+  DOCS_ORIGIN,
+  LLMS_TXT,
+  cleanMarkdown,
+  parseIndex,
+  groupByCategory,
+  filterByCategory,
+} from "./src/filament.js";
+import { ALL_TOPICS, renderBestPractices } from "./src/best-practices.js";
+import { NAME, VERSION, SCHEMA } from "./src/settings.js";
 
-// ─── Server ──────────────────────────────────────────────────────────────────
+const { config } = bootstrap({
+  name: NAME,
+  version: VERSION,
+  description: "Serves Filament documentation to AI agents over the Model Context Protocol.",
+  schema: SCHEMA,
+  importMetaUrl: import.meta.url,
+  examples: [`${NAME} --docs-version 4.x`, `${NAME} --timeout 30000 --cache-max 250`],
+});
 
-const server = new Server(
-  { name: "filament-v5-mcp", version: "2.0.0" },
-  { capabilities: { tools: {} } }
-);
+const BASE = `${DOCS_ORIGIN}/${config.docsVersion}`;
 
-const BASE = "https://filamentphp.com/docs/5.x";
-const LLMS_TXT = "https://filamentphp.com/docs/llms.txt";
+const http = createHttpClient({
+  userAgent: `${NAME}/${VERSION} (+https://github.com/ajaymahato431/filament-mcp)`,
+  timeoutMs: config.requestTimeoutMs,
+  retries: config.retries,
+  cacheMax: config.cacheMax,
+  defaultTtl: config.docTtlMs,
+  negativeTtl: config.negativeTtlMs,
+});
 
-// ─── LRU Cache ───────────────────────────────────────────────────────────────
+/** The published index covers every Filament major version; keep only ours. */
+async function loadIndex() {
+  const raw = await http.fetchText(LLMS_TXT, { ttl: config.indexTtlMs });
+  const entries = parseIndex(raw, { version: config.docsVersion });
 
-const CACHE_MAX = 100;
-const DOC_TTL = 3 * 60 * 60 * 1000; // 3 hours for doc pages
-const INDEX_TTL = 3 * 60 * 60 * 1000; // 3 hours for llms.txt index
-const cache = new Map();
-
-function cacheGet(key) {
-  const entry = cache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > entry.ttl) {
-    cache.delete(key);
-    return null;
-  }
-  // LRU: re-insert to move to end
-  cache.delete(key);
-  cache.set(key, entry);
-  return entry.data;
-}
-
-function cacheSet(key, data, ttl) {
-  if (cache.size >= CACHE_MAX) {
-    // Evict oldest (first key)
-    const oldest = cache.keys().next().value;
-    cache.delete(oldest);
-  }
-  cache.set(key, { data, ts: Date.now(), ttl });
-}
-
-// ─── Fetcher ─────────────────────────────────────────────────────────────────
-
-async function fetchText(url, ttl = DOC_TTL) {
-  const cached = cacheGet(url);
-  if (cached) return cached;
-
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  const text = await res.text();
-  cacheSet(url, text, ttl);
-  return text;
-}
-
-// ─── Markdown Cleaner ────────────────────────────────────────────────────────
-// Strips Mintlify JSX components, sponsor blocks, screenshot tags, and
-// code-fence theme metadata that waste agent tokens.
-
-function cleanMarkdown(md) {
-  let out = md;
-
-  // Remove HTML comments
-  out = out.replace(/<!--[\s\S]*?-->/g, "");
-
-  // Remove JSX imports
-  out = out.replace(/^import\s+[\s\S]*?from\s+['"][^'"]+['"];?\s*$/gm, "");
-
-  // Remove JSX component definitions (export const AutoScreenshot = ...; etc.)
-  // These are multi-line JSX blocks that end with `};`
-  out = out.replace(/^export const \w+[\s\S]*?^};$/gm, "");
-
-  // Remove <AutoScreenshot ... /> tags
-  out = out.replace(/<AutoScreenshot[^>]*\/>/g, "");
-
-  // Remove <EditOnGitHub ... /> and <Footer /> component invocations
-  out = out.replace(/<EditOnGitHub[^>]*\/>/g, "");
-  out = out.replace(/<Footer\s*\/>/g, "");
-
-  // Convert Mintlify admonitions to standard markdown blockquotes
-  out = out.replace(/<Tip>([\s\S]*?)<\/Tip>/g, (_, content) => {
-    return `> **Tip:** ${content.trim()}`;
-  });
-  out = out.replace(/<Warning>([\s\S]*?)<\/Warning>/g, (_, content) => {
-    return `> **Warning:** ${content.trim()}`;
-  });
-  out = out.replace(/<Danger>([\s\S]*?)<\/Danger>/g, (_, content) => {
-    return `> **Danger:** ${content.trim()}`;
-  });
-  out = out.replace(/<Note>([\s\S]*?)<\/Note>/g, (_, content) => {
-    return `> **Note:** ${content.trim()}`;
-  });
-  out = out.replace(/<Info>([\s\S]*?)<\/Info>/g, (_, content) => {
-    return `> **Info:** ${content.trim()}`;
-  });
-
-  // Strip theme metadata from code fences: ```php theme={"theme":"gruvbox-dark-hard"}
-  out = out.replace(
-    /```(\w+)\s+theme=\{[^}]*\}/g,
-    "```$1"
-  );
-
-  // Remove inline images (agents don't need screenshots)
-  out = out.replace(/!\[[^\]]*\]\([^)]*\)/g, "");
-
-  // Collapse 3+ blank lines to 2
-  out = out.replace(/\n{3,}/g, "\n\n");
-
-  // Trim leading/trailing whitespace
-  return out.trim();
-}
-
-// ─── Section Extractor ───────────────────────────────────────────────────────
-// Returns only the content under a specific heading (case-insensitive match).
-// Uses heading hierarchy: extracts from the matched heading to the next heading
-// of equal or higher level.
-
-function extractSection(md, sectionName) {
-  const lines = md.split("\n");
-  const target = sectionName.toLowerCase().trim();
-  let capturing = false;
-  let captureLevel = 0;
-  const result = [];
-
-  for (const line of lines) {
-    const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
-    if (headingMatch) {
-      const level = headingMatch[1].length;
-      const title = headingMatch[2].toLowerCase().trim();
-      if (!capturing && title.includes(target)) {
-        capturing = true;
-        captureLevel = level;
-        result.push(line);
-        continue;
-      }
-      if (capturing && level <= captureLevel) {
-        break; // Next heading of equal or higher level — stop
-      }
-    }
-    if (capturing) {
-      result.push(line);
-    }
+  if (entries.length === 0) {
+    throw new Error(
+      `The documentation index contains no pages for version "${config.docsVersion}". ` +
+        `Set FILAMENT_DOCS_VERSION to a published version such as 5.x or 4.x.`
+    );
   }
 
-  return result.length > 0 ? result.join("\n").trim() : null;
-}
-
-// ─── Index Parser ────────────────────────────────────────────────────────────
-// Parses llms.txt into structured entries: { title, path, url }
-
-function parseIndex(text) {
-  const entries = [];
-  const regex = /^- \[(.+?)\]\((.+?)\)$/gm;
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    const title = match[1];
-    const url = match[2];
-    // Extract path relative to base: https://filamentphp.com/docs/5.x/resources/overview.md → resources/overview
-    const pathMatch = url.match(/\/docs\/5\.x\/(.+?)\.md$/);
-    const path = pathMatch ? pathMatch[1] : url;
-    entries.push({ title, path, url });
-  }
   return entries;
 }
 
-// ─── Search Scorer ───────────────────────────────────────────────────────────
-
-function scoreMatch(entry, query) {
-  const q = query.toLowerCase();
-  const title = entry.title.toLowerCase();
-  const path = entry.path.toLowerCase();
-
-  // Exact title match
-  if (title === q) return 100;
-  // Title starts with query
-  if (title.startsWith(q)) return 80;
-  // Title contains query
-  if (title.includes(q)) return 60;
-  // Path contains query
-  if (path.includes(q)) return 40;
-  // Partial word match in title
-  const words = q.split(/\s+/);
-  const matchCount = words.filter(
-    (w) => title.includes(w) || path.includes(w)
-  ).length;
-  if (matchCount > 0) return 20 * (matchCount / words.length);
-
-  return 0;
+async function readPage(path) {
+  const raw = await http.fetchText(`${BASE}/${path}.md`, { ttl: config.docTtlMs });
+  return cleanMarkdown(raw);
 }
 
-// ─── Best Practices Content (Filament v5 Accurate) ───────────────────────────
+const server = new McpServer({ name: NAME, version: VERSION }, { capabilities: { tools: {} } });
 
-const BEST_PRACTICES = {
-  architecture: `## Architecture
-- Use separated Schema classes (CustomerForm.php) and Table classes (CustomersTable.php) — v5 generates these by default. Keep Resource classes lean.
-- Move complex mutation logic into Model Observers or Service classes, not into form/table definitions.
-- Use \`->components()\` for form schemas (replaces v4's \`->schema()\` on forms).
-- Use \`->recordActions()\` for row-level table actions and \`->toolbarActions()\` for bulk/header actions.
-- Use \`->schema()\` for action modal form content (NOT \`->form()\`).
-- Prefer simple (modal) resources (\`--simple\`) for CRUD-only models that don't need separate pages.`,
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, openWorldHint: true };
+const NETWORK_HINT = "Check network access to filamentphp.com, then try again.";
 
-  actions: `## Actions
-- Prefer built-in Actions (CreateAction, EditAction, DeleteAction, ViewAction) over custom Livewire components.
-- Use Action modals (\`->schema([...])\`) and slide-overs instead of creating custom pages or Blade views.
-- Use the \`Heroicon\` enum for icons: \`->icon(Heroicon::PencilSquare)\` instead of string \`'heroicon-o-pencil-square'\`.
-- Use \`->requiresConfirmation()\` for destructive actions.
-- Use \`->fillForm(fn ($record) => $record)\` to pre-fill modal forms.`,
+// ─── list_filament_docs ──────────────────────────────────────────────────────
 
-  database: `## Database & Queries
-- Use \`modifyQueryUsing()\` on tables to eager-load relationships and prevent N+1.
-- Use \`->searchable()\` and \`->sortable()\` only on indexed database columns.
-- Rely on \`->relationship()\` for saving related data from forms instead of manual \`mutateFormDataBeforeSave\`.
-- Override \`getEloquentQuery()\` for resource-wide query constraints (scopes, soft-deletes, tenancy).`,
-
-  forms: `## Forms
-- Use the \`Hidden\` component to pass contextual data instead of relying on global state.
-- Use \`Operation::Create\` / \`Operation::Edit\` enum with \`->hiddenOn()\` / \`->visibleOn()\` for conditional fields.
-- Use \`->relationship()\` on Select and other components for automatic relationship management.
-- Prefer Filament's built-in validation rules over custom rule objects where possible.`,
-
-  authorization: `## Authorization
-- Rely strictly on Laravel Policies. Filament auto-maps: viewAny, create, update, view, delete, forceDelete, restore, reorder.
-- Do NOT write manual auth checks in Resources — use Policy methods.
-- Use \`$shouldSkipAuthorization = true\` only for development.
-- Use \`->authorizeIndividualRecords()\` on bulk actions when per-record auth is needed.`,
-
-  ui: `## UI & Styling
-- Use Filament's theme config (Tailwind) and \`->extraAttributes()\` over raw CSS or custom Blade views.
-- Use \`SubNavigationPosition::Top\` for tabbed navigation within resources.
-- Use Section, Flex, Grid layout components for form organization.
-- Use \`->grow(false)\` to prevent components from expanding.`,
-
-  antiPatterns: `## Anti-Patterns to Avoid
-- DON'T use \`->schema()\` on form definitions — use \`->components()\` (v5 change).
-- DON'T use \`->actions()\` on tables — use \`->recordActions()\` or \`->toolbarActions()\` (v5 change).
-- DON'T use string icon names — use the \`Heroicon\` enum.
-- DON'T create custom Livewire components for CRUD — use Resources.
-- DON'T put heavy logic in Resource classes — use Services/Observers.
-- DON'T hardcode routes — use \`ResourceClass::getUrl()\`.
-- DON'T define forms/tables inline in Resource if they're large — use the separated Schema/Table classes.`,
-};
-
-const ALL_TOPICS = Object.keys(BEST_PRACTICES);
-
-// ─── Tool Definitions ────────────────────────────────────────────────────────
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "list_filament_docs",
-      description:
-        "Returns a compact index of ALL Filament v5 documentation pages with their paths. Call this FIRST to discover available pages before reading. Costs ~200 tokens.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          category: {
-            type: "string",
-            description:
-              'Optional filter: "forms", "tables", "actions", "resources", "schemas", "infolists", "navigation", "widgets", "notifications", "plugins", "styling", "testing", "advanced", "introduction", "components". Returns all if omitted.',
-          },
-        },
-      },
+server.registerTool(
+  "list_filament_docs",
+  {
+    title: "List Filament documentation pages",
+    description:
+      "Browses the Filament documentation index. Called with no arguments it returns a " +
+      "category summary (~100 tokens) — start here. Pass `category` to list the pages in one " +
+      'category (~100-400 tokens). Pass `category: "all"` to list every page (~4000 tokens; ' +
+      "prefer search_filament_docs instead).",
+    inputSchema: {
+      category: z
+        .string()
+        .optional()
+        .describe(
+          'Category to list, e.g. "forms", "tables", "resources", "actions". ' +
+            'Use "all" for every page. Omit for the category summary.'
+        ),
+      limit: z.number().int().positive().max(500).optional().describe("Maximum pages to return."),
+      offset: z.number().int().min(0).optional().describe("Pages to skip, for paging."),
     },
-    {
-      name: "read_filament_docs",
-      description:
-        'Reads a Filament v5 documentation page. Use list_filament_docs first to find the correct path. Examples: "resources/overview", "forms/select", "tables/columns/text", "actions/modals".',
-      inputSchema: {
-        type: "object",
-        properties: {
-          path: {
-            type: "string",
-            description:
-              'The doc page path (e.g., "resources/overview", "forms/select"). Required.',
-          },
-          section: {
-            type: "string",
-            description:
-              'Optional heading name to extract only that section (e.g., "Authorization", "Creating a resource"). Drastically reduces tokens.',
-          },
-        },
-        required: ["path"],
-      },
-    },
-    {
-      name: "search_filament_docs",
-      description:
-        'Searches Filament v5 docs by keyword. Returns matching page titles, paths, and optionally fetches the top result content. Use when you don\'t know the exact page path.',
-      inputSchema: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description:
-              'Search query (e.g., "select filter", "authorization", "repeater", "soft delete").',
-          },
-          includeContent: {
-            type: "boolean",
-            description:
-              "If true, fetches and returns the content of the top matching page. Default: false (returns only page list).",
-          },
-          maxResults: {
-            type: "number",
-            description: "Max number of matching pages to return. Default: 5.",
-          },
-        },
-        required: ["query"],
-      },
-    },
-    {
-      name: "filament_best_practices",
-      description:
-        'Returns Filament v5 coding guidelines and anti-patterns. Topics: "architecture", "actions", "database", "forms", "authorization", "ui", "antiPatterns". Returns all if omitted.',
-      inputSchema: {
-        type: "object",
-        properties: {
-          topic: {
-            type: "string",
-            description: `Optional topic filter: ${ALL_TOPICS.map((t) => `"${t}"`).join(", ")}. Returns all topics if omitted.`,
-          },
-        },
-      },
-    },
-  ],
-}));
+    annotations: READ_ONLY,
+  },
+  safeHandler(async ({ category, limit, offset = 0 }) => {
+    const entries = await loadIndex();
 
-// ─── Tool Handlers ───────────────────────────────────────────────────────────
+    // Default view: a compact map of the documentation, not the whole thing.
+    if (!category) {
+      const groups = groupByCategory(entries);
+      const rows = groups.map((g) => `  ${g.category} — ${g.count} pages`).join("\n");
+      return textResult(
+        `# Filament ${config.docsVersion} documentation\n` +
+          `${entries.length} pages across ${groups.length} categories.\n\n${rows}\n\n` +
+          `Next: call again with a category, or use search_filament_docs to find a page directly.`
+      );
+    }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+    const wantsAll = String(category).toLowerCase() === "all";
+    const selected = wantsAll ? entries : filterByCategory(entries, category);
 
-  // ── list_filament_docs ──────────────────────────────────────────────────
-  if (name === "list_filament_docs") {
+    if (selected.length === 0) {
+      const available = groupByCategory(entries)
+        .map((g) => g.category)
+        .join(", ");
+      return errorResult(
+        `No category "${category}" in the Filament ${config.docsVersion} docs.\n` +
+          `Available categories: ${available}`
+      );
+    }
+
+    const page = selected.slice(offset, offset + (limit ?? selected.length));
+    const more =
+      offset + page.length < selected.length
+        ? `\n\nMore available: call again with offset ${offset + page.length}.`
+        : "";
+
+    return textResult(
+      `# Filament ${config.docsVersion} — ${wantsAll ? "all pages" : category}\n` +
+        `Showing ${page.length} of ${selected.length}\n\n` +
+        `${page.map((e) => `${e.path} — ${e.title}`).join("\n")}${more}`
+    );
+  }, NETWORK_HINT)
+);
+
+// ─── read_filament_docs ──────────────────────────────────────────────────────
+
+server.registerTool(
+  "read_filament_docs",
+  {
+    title: "Read a Filament documentation page",
+    description:
+      "Reads one Filament documentation page. Use `section` to extract a single heading " +
+      "instead of the whole page — most pages are far larger than the part you need. Find " +
+      'paths with list_filament_docs or search_filament_docs. Examples: "resources/overview", ' +
+      '"forms/select", "tables/columns/text".',
+    inputSchema: {
+      path: z.string().min(1).describe('Doc page path, e.g. "forms/select". Required.'),
+      section: z
+        .string()
+        .optional()
+        .describe('Heading to extract, e.g. "Authorization". Greatly reduces output size.'),
+      outline: z
+        .boolean()
+        .optional()
+        .describe("Return only the page's heading outline, to choose a section cheaply."),
+    },
+    annotations: READ_ONLY,
+  },
+  safeHandler(async ({ path, section, outline }) => {
+    const clean = path.replace(/^\/+/, "").replace(/\.md$/, "");
+    if (!clean) return errorResult('The "path" parameter cannot be empty.');
+
+    let content;
     try {
-      const raw = await fetchText(LLMS_TXT, INDEX_TTL);
-      let entries = parseIndex(raw);
-
-      const category = args?.category?.toLowerCase();
-      if (category) {
-        entries = entries.filter(
-          (e) =>
-            e.path.startsWith(category + "/") || e.path.startsWith(category)
+      content = await readPage(clean);
+    } catch (error) {
+      if (error?.status === 404) {
+        return errorResult(
+          `No such page: ${clean}\n` +
+            `That path does not exist in the Filament ${config.docsVersion} docs. ` +
+            `Use search_filament_docs to find the right one.`
         );
       }
-
-      // Format as compact list: "path — Title"
-      const lines = entries.map((e) => `${e.path} — ${e.title}`);
-      const text = `# Filament v5 Documentation Index${category ? ` (${category})` : ""}\n${entries.length} pages available.\n\n${lines.join("\n")}`;
-
-      return { content: [{ type: "text", text }] };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to fetch docs index: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  }
-
-  // ── read_filament_docs ──────────────────────────────────────────────────
-  if (name === "read_filament_docs") {
-    const path = (args?.path || "").replace(/^\/+/, "").replace(/\.md$/, "");
-    if (!path) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: 'Missing required "path" parameter. Use list_filament_docs to discover available paths.',
-          },
-        ],
-        isError: true,
-      };
+      throw error;
     }
 
-    const url = `${BASE}/${path}.md`;
-    try {
-      const raw = await fetchText(url);
-      let content = cleanMarkdown(raw);
+    if (outline) {
+      return textResult(`# Outline — ${clean}\n\n${renderOutline(content)}`);
+    }
 
-      // If a section filter is provided, extract only that section
-      const section = args?.section;
-      if (section) {
-        const extracted = extractSection(content, section);
-        if (extracted) {
-          content = extracted;
-        } else {
-          content = `> Section "${section}" not found on this page.\n\n${content}`;
-        }
+    if (section) {
+      const extracted = extractSection(content, section);
+      if (extracted) return textResult(`Source: ${BASE}/${clean}\n\n${extracted}`);
+
+      // Returning the whole page here would be the opposite of what was asked;
+      // the outline lets the caller retry precisely and cheaply.
+      return textResult(
+        `Section "${section}" was not found on ${clean}. Available headings:\n\n` +
+          `${renderOutline(content)}\n\n` +
+          `Re-read with one of these, or omit "section" for the full page.`
+      );
+    }
+
+    return textResult(`Source: ${BASE}/${clean}\n\n${content}`);
+  }, NETWORK_HINT)
+);
+
+// ─── search_filament_docs ────────────────────────────────────────────────────
+
+server.registerTool(
+  "search_filament_docs",
+  {
+    title: "Search the Filament documentation",
+    description:
+      "Finds Filament documentation pages by keyword, returning ranked titles and paths. " +
+      "Use this when you do not already know the exact page path.",
+    inputSchema: {
+      query: z.string().min(1).describe('Search terms, e.g. "select filter", "soft delete".'),
+      includeContent: z
+        .boolean()
+        .optional()
+        .describe("Also return the full content of the top result. Default false."),
+      maxResults: z
+        .number()
+        .int()
+        .positive()
+        .max(50)
+        .optional()
+        .describe("Result count. Default 5."),
+    },
+    annotations: READ_ONLY,
+  },
+  safeHandler(async ({ query, includeContent = false, maxResults }) => {
+    const entries = await loadIndex();
+    const results = searchEntries(entries, query, { limit: maxResults ?? config.maxResults });
+
+    if (results.length === 0) {
+      const categories = groupByCategory(entries)
+        .map((g) => g.category)
+        .join(", ");
+      return textResult(
+        `No Filament ${config.docsVersion} pages matched "${query}".\n` +
+          `Try broader terms, or browse a category: ${categories}`
+      );
+    }
+
+    let text =
+      `# Search: "${query}"\n${results.length} result${results.length === 1 ? "" : "s"}:\n\n` +
+      results.map((e, i) => `${i + 1}. **${e.title}** — \`${e.path}\``).join("\n");
+
+    if (includeContent) {
+      try {
+        text += `\n\n---\n\n## ${results[0].title}\n\n${await readPage(results[0].path)}`;
+      } catch {
+        text += `\n\n> Could not fetch the top result; read it directly with read_filament_docs.`;
       }
-
-      return {
-        content: [
-          { type: "text", text: `Source: ${BASE}/${path}\n\n${content}` },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to fetch: ${url}\n${error.message}\n\nUse list_filament_docs to find valid paths.`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  }
-
-  // ── search_filament_docs ────────────────────────────────────────────────
-  if (name === "search_filament_docs") {
-    const query = args?.query;
-    if (!query) {
-      return {
-        content: [
-          { type: "text", text: 'Missing required "query" parameter.' },
-        ],
-        isError: true,
-      };
     }
 
-    try {
-      const raw = await fetchText(LLMS_TXT, INDEX_TTL);
-      const entries = parseIndex(raw);
-      const maxResults = args?.maxResults || 5;
-      const includeContent = args?.includeContent || false;
+    return textResult(text);
+  }, NETWORK_HINT)
+);
 
-      // Score and sort
-      const scored = entries
-        .map((e) => ({ ...e, score: scoreMatch(e, query) }))
-        .filter((e) => e.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, maxResults);
+// ─── filament_best_practices ─────────────────────────────────────────────────
 
-      if (scored.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No documentation pages matched "${query}". Try broader terms or use list_filament_docs to browse.`,
-            },
-          ],
-        };
-      }
-
-      let text = `# Search: "${query}"\n${scored.length} results:\n\n`;
-      text += scored
-        .map((e, i) => `${i + 1}. **${e.title}** — \`${e.path}\``)
-        .join("\n");
-
-      // Optionally fetch top result content
-      if (includeContent && scored.length > 0) {
-        const topUrl = `${BASE}/${scored[0].path}.md`;
-        try {
-          const raw = await fetchText(topUrl);
-          const content = cleanMarkdown(raw);
-          text += `\n\n---\n\n## ${scored[0].title}\n\n${content}`;
-        } catch {
-          text += `\n\n> Could not fetch content for top result.`;
-        }
-      }
-
-      return { content: [{ type: "text", text }] };
-    } catch (error) {
-      return {
-        content: [
-          { type: "text", text: `Search failed: ${error.message}` },
-        ],
-        isError: true,
-      };
-    }
-  }
-
-  // ── filament_best_practices ─────────────────────────────────────────────
-  if (name === "filament_best_practices") {
-    const topic = args?.topic?.toLowerCase();
-
-    if (topic && BEST_PRACTICES[topic]) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `# Filament v5 Best Practices — ${topic}\n\n${BEST_PRACTICES[topic]}`,
-          },
-        ],
-      };
-    }
-
-    // Return all topics
-    const all = Object.values(BEST_PRACTICES).join("\n\n");
-    return {
-      content: [
-        { type: "text", text: `# Filament v5 Best Practices\n\n${all}` },
-      ],
-    };
-  }
-
-  throw new Error(`Unknown tool: ${name}`);
-});
+server.registerTool(
+  "filament_best_practices",
+  {
+    title: "Filament best practices",
+    description:
+      "Returns curated Filament v5 coding guidelines and anti-patterns. Answers instantly " +
+      "with no network access. Read this before writing or refactoring Filament code.",
+    inputSchema: {
+      topic: z.enum(ALL_TOPICS).optional().describe("Single topic to return. Omit for all topics."),
+    },
+    annotations: { ...READ_ONLY, openWorldHint: false },
+  },
+  safeHandler(async ({ topic }) => textResult(renderBestPractices(topic)))
+);
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Filament v5 MCP Server v2.0.0 running (token-optimized)");
-}
-
-main();
+runMain(async () => {
+  await serveStdio(server, { name: NAME, version: VERSION });
+});
