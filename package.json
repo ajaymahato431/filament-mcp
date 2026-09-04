@@ -1,6 +1,6 @@
 {
   "name": "filament-mcp",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Model Context Protocol server that serves Filament v5 documentation to AI coding agents",
   "type": "module",
   "main": "index.js",
